@@ -5,9 +5,9 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import aiohttp
-from aiogram import Bot, Dispatcher, Router
+from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import CommandStart
-from aiogram.types import Message
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 
@@ -18,8 +18,17 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 router = Router()
 
-# Простое хранилище зарегистрированных пользователей
+# Simple in-memory storage for registered users
 registered_users = {}
+
+
+def get_main_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Get prices now")]
+        ],
+        resize_keyboard=True
+    )
 
 
 def format_price(value):
@@ -37,8 +46,7 @@ def format_change(value):
 def format_updated_time(timestamp):
     if isinstance(timestamp, (int, float)):
         dt_utc = datetime.fromtimestamp(timestamp, tz=timezone.utc)
-        dt_tashkent = dt_utc.astimezone(ZoneInfo("Asia/Tashkent"))
-        return dt_tashkent.strftime("%Y-%m-%d %H:%M Asia/Tashkent")
+        return dt_utc.strftime("%Y-%m-%d %H:%M UTC")
     return "n/a"
 
 
@@ -92,7 +100,7 @@ async def cmd_start(message: Message):
 
     registered_users[user_id] = {
         "chat_id": chat_id,
-        "registered_at": datetime.now(tz=ZoneInfo("Asia/Tashkent")).strftime("%Y-%m-%d %H:%M:%S"),
+        "registered_at": datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         "active": True,
     }
 
@@ -100,17 +108,33 @@ async def cmd_start(message: Message):
         "Welcome to Hamza Rates.\n\n"
         "You are subscribed.\n"
         "I will send you a daily crypto snapshot with BTC, ETH, BNB and TON prices in USD.\n\n"
-        "Delivery time: every day at 09:00 Asia/Tashkent."
+        "Use the button below anytime to get the latest prices instantly."
     )
 
-    await message.answer(text)
+    await message.answer(
+        text,
+        reply_markup=get_main_keyboard()
+    )
+
+
+@router.message(F.text == "Get prices now")
+async def cmd_get_prices_now(message: Message):
+    try:
+        data = await fetch_prices()
+        text = build_daily_message(data)
+        await message.answer(text)
+    except Exception as e:
+        logging.error(f"Failed to fetch prices on demand: {e}")
+        await message.answer(
+            "Sorry, I could not fetch prices right now. Please try again in a moment."
+        )
 
 
 @router.message()
 async def fallback_message(message: Message):
     await message.answer(
-        "This bot is simple by design.\n"
-        "Send /start to subscribe and receive daily crypto prices at 09:00 Asia/Tashkent."
+        "Send /start to subscribe.\n"
+        "Then use the button below to get prices anytime."
     )
 
 
@@ -130,7 +154,7 @@ async def send_daily_snapshot(bot: Bot):
             chat_id = user_data["chat_id"]
 
             try:
-                await bot.send_message(chat_id=chat_id, text=text)
+                await bot.send_message(chat_id=chat_id, text=text, reply_markup=get_main_keyboard())
             except Exception as e:
                 logging.error(f"Failed to send message to {chat_id}: {e}")
 
