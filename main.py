@@ -2,12 +2,16 @@ import asyncio
 import logging
 import os
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
 
 import aiohttp
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import CommandStart
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import (
+    Message,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    CallbackQuery,
+)
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 
@@ -17,17 +21,14 @@ logging.basicConfig(level=logging.INFO)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 router = Router()
-
-# Simple in-memory storage for registered users
 registered_users = {}
 
 
 def get_main_keyboard():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="Get prices now")]
-        ],
-        resize_keyboard=True
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Get prices now", callback_data="get_prices_now")]
+        ]
     )
 
 
@@ -107,8 +108,8 @@ async def cmd_start(message: Message):
     text = (
         "Welcome to Hamza Rates.\n\n"
         "You are subscribed.\n"
-        "I will send you a daily crypto snapshot with BTC, ETH, BNB and TON prices in USD.\n\n"
-        "Use the button below anytime to get the latest prices instantly."
+        "You will receive a daily crypto snapshot with BTC, ETH, BNB and TON prices in USD.\n\n"
+        "You can also check the latest prices anytime using the button below."
     )
 
     await message.answer(
@@ -117,24 +118,27 @@ async def cmd_start(message: Message):
     )
 
 
-@router.message(F.text == "Get prices now")
-async def cmd_get_prices_now(message: Message):
+@router.callback_query(F.data == "get_prices_now")
+async def get_prices_now(callback: CallbackQuery):
     try:
         data = await fetch_prices()
         text = build_daily_message(data)
-        await message.answer(text)
+
+        await callback.message.answer(
+            text,
+            reply_markup=get_main_keyboard()
+        )
+        await callback.answer()
     except Exception as e:
         logging.error(f"Failed to fetch prices on demand: {e}")
-        await message.answer(
-            "Sorry, I could not fetch prices right now. Please try again in a moment."
-        )
+        await callback.answer("Could not fetch prices right now.", show_alert=True)
 
 
 @router.message()
 async def fallback_message(message: Message):
     await message.answer(
-        "Send /start to subscribe.\n"
-        "Then use the button below to get prices anytime."
+        "Send /start to subscribe.",
+        reply_markup=get_main_keyboard()
     )
 
 
@@ -147,14 +151,18 @@ async def send_daily_snapshot(bot: Bot):
         data = await fetch_prices()
         text = build_daily_message(data)
 
-        for user_id, user_data in registered_users.items():
+        for _, user_data in registered_users.items():
             if not user_data.get("active"):
                 continue
 
             chat_id = user_data["chat_id"]
 
             try:
-                await bot.send_message(chat_id=chat_id, text=text, reply_markup=get_main_keyboard())
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    reply_markup=get_main_keyboard()
+                )
             except Exception as e:
                 logging.error(f"Failed to send message to {chat_id}: {e}")
 
