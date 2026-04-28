@@ -34,8 +34,15 @@ DEFAULT_DELIVERY_HOUR = 9
 DELIVERY_TIMEZONE = ZoneInfo('Asia/Tashkent')
 USER_COOLDOWN_SECONDS = 8
 CACHE_TTL = 60
+
 COINS = ['BTC', 'ETH', 'BNB', 'TON', 'XRP']
-CC_URL = 'https://min-api.cryptocompare.com/data/pricemultifull?fsyms=BTC,ETH,BNB,TON,XRP&tsyms=USD'
+PAPRIKA_IDS = {
+    'BTC': 'btc-bitcoin',
+    'ETH': 'eth-ethereum',
+    'BNB': 'bnb-binance-coin',
+    'TON': 'ton-toncoin',
+    'XRP': 'xrp-xrp',
+}
 
 router = Router()
 _price_cache: dict = {}
@@ -72,7 +79,17 @@ def save_subscribers() -> None:
 registered_users: dict = load_subscribers()
 
 
-# ---- CryptoCompare API ----
+# ---- CoinPaprika API (free, no key, no geo restrictions) ----
+
+async def _fetch_one(session: aiohttp.ClientSession, coin: str) -> tuple[str, dict]:
+    pid = PAPRIKA_IDS[coin]
+    url = f'https://api.coinpaprika.com/v1/tickers/{pid}'
+    async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+        resp.raise_for_status()
+        data = await resp.json()
+    usd = data['quotes']['USD']
+    return coin, {'price': float(usd['price']), 'change': float(usd['percent_change_24h'])}
+
 
 async def fetch_prices(force: bool = False) -> dict:
     global _price_cache, _price_cache_time
@@ -81,31 +98,28 @@ async def fetch_prices(force: bool = False) -> dict:
         return _price_cache
 
     async with aiohttp.ClientSession() as session:
-        async with session.get(CC_URL, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            resp.raise_for_status()
-            raw = await resp.json()
+        tasks = [_fetch_one(session, coin) for coin in COINS]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    result = {}
-    for coin in COINS:
-        try:
-            info = raw['RAW'][coin]['USD']
-            result[coin] = {
-                'price': float(info['PRICE']),
-                'change': float(info['CHANGEPCT24HOUR']),
-            }
-        except (KeyError, TypeError):
-            pass
+    data = {}
+    for r in results:
+        if isinstance(r, Exception):
+            log.error('coin fetch error: %s', r)
+            continue
+        coin, info = r
+        data[coin] = info
 
-    if result:
-        _price_cache = result
+    if data:
+        _price_cache = data
         _price_cache_time = time.monotonic()
+        log.info('Prices fetched: %s', list(data.keys()))
 
-    return result
+    return data
 
 
 # ---- Formatting ----
 
-def fmt_price(v: float) -> str:
+def fmt(v: float) -> str:
     if v >= 1000:
         return f'${v:,.2f}'
     if v >= 1:
@@ -122,11 +136,9 @@ def build_msg(data: dict) -> str:
             continue
         p, c = info['price'], info['change']
         icon = '🟢' if c >= 0 else '🔴'
-        lines.append(f'{icon} <b>{coin}</b>  <code>{fmt_price(p)}</code>  {c:+.2f}%')
+        lines.append(f'{icon} <b>{coin}</b>  <code>{fmt(p)}</code>  {c:+.2f}%')
     ts = datetime.now(tz=DELIVERY_TIMEZONE).strftime('%H:%M, %d %b')
-    header = '<b>Crypto prices [USD]</b>'
-    footer = f'<i>{ts} Tashkent</i>'
-    return header + '\n\n' + '\n'.join(lines) + '\n\n' + footer
+    return '<b>Crypto prices [USD]</b>\n\n' + '\n'.join(lines) + f'\n\n<i>{ts} Tashkent</i>'
 
 
 # ---- Keyboard ----
@@ -146,21 +158,22 @@ def mark(uid: int) -> None:
     _user_last_request[uid] = time.monotonic()
 
 
-# ---- Shared price sender ----
+# ---- Price sender ----
 
 async def send_prices(message: Message, uid: int) -> None:
     w = cooldown(uid)
     if w > 0:
         await message.answer(f'Please wait {int(w)+1}s.')
         return
-
     mark(uid)
-
     try:
         data = await fetch_prices()
+        if not data:
+            await message.answer('Could not get prices. Try again in a moment.', reply_markup=kb())
+            return
         await message.answer(build_msg(data), reply_markup=kb())
     except Exception as e:
-        log.error('fetch error: %s', e)
+        log.error('send_prices error: %s', e)
         await message.answer('Could not get prices. Try again in a moment.', reply_markup=kb())
 
 
@@ -170,7 +183,6 @@ async def send_prices(message: Message, uid: int) -> None:
 async def cmd_start(message: Message):
     uid = message.from_user.id
     ex = registered_users.get(uid)
-
     if ex and ex.get('active'):
         h = ex.get('delivery_hour', DEFAULT_DELIVERY_HOUR)
         await message.answer(
@@ -178,7 +190,6 @@ async def cmd_start(message: Message):
             reply_markup=kb()
         )
         return
-
     registered_users[uid] = {
         'chat_id': message.chat.id,
         'active': True,
@@ -186,7 +197,6 @@ async def cmd_start(message: Message):
         'registered_at': datetime.now(tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC'),
     }
     save_subscribers()
-
     h = DEFAULT_DELIVERY_HOUR
     await message.answer(
         '<b>Welcome to Hamza Rates!</b>\n\n'
@@ -212,12 +222,10 @@ async def cmd_settime(message: Message):
     if not user or not user.get('active'):
         await message.answer('Send /start first.')
         return
-
     parts = (message.text or '').strip().split()
     if len(parts) < 2 or not parts[1].isdigit() or not (0 <= int(parts[1]) <= 23):
         await message.answer('Usage: /settime 9  (hour 0-23)')
         return
-
     h = int(parts[1])
     user['delivery_hour'] = h
     save_subscribers()
@@ -256,7 +264,7 @@ async def cmd_help(message: Message):
         '/settime 9 — delivery hour (0-23)\n'
         '/status — settings\n'
         '/stop — unsubscribe\n\n'
-        'Coins: BTC ETH BNB TON XRP | Source: CryptoCompare',
+        'Coins: BTC ETH BNB TON XRP | Source: CoinPaprika',
         reply_markup=kb()
     )
 
@@ -267,10 +275,8 @@ async def cb_prices(callback: CallbackQuery):
         await callback.answer()
     except TelegramBadRequest:
         pass
-
     if not callback.message or not callback.from_user:
         return
-
     await send_prices(callback.message, callback.from_user.id)
 
 
@@ -283,20 +289,19 @@ async def fallback(message: Message):
 
 async def send_daily(bot: Bot):
     current_hour = datetime.now(tz=DELIVERY_TIMEZONE).hour
-    targets = [
-        v for v in registered_users.values()
-        if v.get('active') and v.get('delivery_hour', DEFAULT_DELIVERY_HOUR) == current_hour
-    ]
+    targets = [v for v in registered_users.values()
+               if v.get('active') and v.get('delivery_hour', DEFAULT_DELIVERY_HOUR) == current_hour]
     if not targets:
         return
-
     try:
         data = await fetch_prices(force=True)
+        if not data:
+            log.error('daily: empty data')
+            return
         text = build_msg(data)
     except Exception as e:
         log.error('daily fetch failed: %s', e)
         return
-
     sent = failed = 0
     for u in targets:
         try:
@@ -305,8 +310,7 @@ async def send_daily(bot: Bot):
         except Exception as e:
             failed += 1
             log.error('send failed: %s', e)
-
-    log.info('Daily %02d:00 done sent=%d failed=%d', current_hour, sent, failed)
+    log.info('Daily %02d:00 sent=%d failed=%d', current_hour, sent, failed)
 
 
 async def setup_commands(bot: Bot) -> None:
@@ -324,18 +328,14 @@ async def setup_commands(bot: Bot) -> None:
 async def start_health_server():
     async def health(_req):
         return aio_web.Response(text='OK')
-
     app = aio_web.Application()
     app.router.add_get('/', health)
     app.router.add_get('/health', health)
-
     runner = aio_web.AppRunner(app)
     await runner.setup()
-
     port = int(os.getenv('PORT', '10000'))
     site = aio_web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-
     log.info('Health server on port %d', port)
     return runner
 
@@ -345,22 +345,16 @@ async def start_health_server():
 async def main():
     if not BOT_TOKEN:
         raise ValueError('BOT_TOKEN not set')
-
     runner = await start_health_server()
-
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
     dp.include_router(router)
-
     scheduler = AsyncIOScheduler(timezone=DELIVERY_TIMEZONE)
     scheduler.add_job(send_daily, 'cron', minute=0, args=[bot], id='daily', replace_existing=True)
     scheduler.start()
-
     await setup_commands(bot)
-
     me = await bot.get_me()
     log.info('Bot started: @%s | Subscribers: %d', me.username, len(registered_users))
-
     try:
         await dp.start_polling(bot, drop_pending_updates=True)
     finally:
