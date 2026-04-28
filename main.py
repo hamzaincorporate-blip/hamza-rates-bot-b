@@ -79,7 +79,7 @@ def save_subscribers() -> None:
 registered_users: dict = load_subscribers()
 
 
-# ---- CoinPaprika API (free, no key, no geo restrictions) ----
+# ---- CoinPaprika API ----
 
 async def _fetch_one(session: aiohttp.ClientSession, coin: str) -> tuple[str, dict]:
     pid = PAPRIKA_IDS[coin]
@@ -138,7 +138,12 @@ def build_msg(data: dict) -> str:
         icon = '🟢' if c >= 0 else '🔴'
         lines.append(f'{icon} <b>{coin}</b>  <code>{fmt(p)}</code>  {c:+.2f}%')
     ts = datetime.now(tz=DELIVERY_TIMEZONE).strftime('%H:%M, %d %b')
-    return '<b>Crypto prices [USD]</b>\n\n' + '\n'.join(lines) + f'\n\n<i>{ts} Tashkent</i>'
+    return (
+        '<b>Crypto prices [USD]</b>\n\n'
+        + '\n'.join(lines)
+        + f'\n\n<i>{ts} Tashkent</i>\n'
+        + '<a href="https://t.me/hamza_rates_bot">@hamza_rates_bot</a>'
+    )
 
 
 # ---- Keyboard ----
