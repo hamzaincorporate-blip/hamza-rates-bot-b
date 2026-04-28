@@ -14,168 +14,87 @@ from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
-    BotCommand,
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Message,
+    BotCommand, CallbackQuery,
+    InlineKeyboardButton, InlineKeyboardMarkup, Message,
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 
 load_dotenv()
-
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
 )
-log = logging.getLogger("hamza-rates")
+log = logging.getLogger('hamza-rates')
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY", "")
-
-SUBSCRIBERS_FILE = "subscribers.json"
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+SUBSCRIBERS_FILE = 'subscribers.json'
 DEFAULT_DELIVERY_HOUR = 9
-DELIVERY_TIMEZONE = ZoneInfo("Asia/Tashkent")
+DELIVERY_TIMEZONE = ZoneInfo('Asia/Tashkent')
 USER_COOLDOWN_SECONDS = 8
 CACHE_TTL = 60
-
-COINS = ["BTC", "ETH", "BNB", "TON", "XRP"]
-CG_IDS = {
-    "BTC": "bitcoin",
-    "ETH": "ethereum",
-    "BNB": "binancecoin",
-    "TON": "the-open-network",
-    "XRP": "ripple",
-}
+COINS = ['BTC', 'ETH', 'BNB', 'TON', 'XRP']
+CC_URL = 'https://min-api.cryptocompare.com/data/pricemultifull?fsyms=BTC,ETH,BNB,TON,XRP&tsyms=USD'
 
 router = Router()
 _price_cache: dict = {}
-_price_cache_time = 0.0
+_price_cache_time: float = 0.0
 _user_last_request: dict[int, float] = {}
 
 
-# ---------------- Persistence ----------------
+# ---- Persistence ----
 
 def load_subscribers() -> dict:
     if not os.path.exists(SUBSCRIBERS_FILE):
         return {}
     try:
-        with open(SUBSCRIBERS_FILE, "r", encoding="utf-8") as f:
+        with open(SUBSCRIBERS_FILE, 'r', encoding='utf-8') as f:
             data = json.load(f)
         return {int(k): v for k, v in data.items() if isinstance(v, dict)}
     except Exception as e:
-        log.error("load_subscribers error: %s", e)
+        log.error('load error: %s', e)
         return {}
 
 
 def save_subscribers() -> None:
-    tmp = SUBSCRIBERS_FILE + ".tmp"
+    tmp = SUBSCRIBERS_FILE + '.tmp'
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
+        with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(registered_users, f, ensure_ascii=False, indent=2)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, SUBSCRIBERS_FILE)
     except Exception as e:
-        log.error("save_subscribers error: %s", e)
+        log.error('save error: %s', e)
 
 
-registered_users = load_subscribers()
+registered_users: dict = load_subscribers()
 
 
-# ---------------- Helpers ----------------
-
-def keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📊 Get prices now", callback_data="get_prices")]
-        ]
-    )
-
-
-def check_cooldown(user_id: int) -> float:
-    return max(
-        0.0,
-        USER_COOLDOWN_SECONDS - (time.monotonic() - _user_last_request.get(user_id, 0.0)),
-    )
-
-
-def mark_request(user_id: int) -> None:
-    _user_last_request[user_id] = time.monotonic()
-
-
-def format_price(value: float) -> str:
-    if value >= 1000:
-        return f"${value:,.2f}"
-    if value >= 1:
-        return f"${value:,.2f}"
-    if value >= 0.01:
-        return f"${value:,.4f}"
-    return f"${value:,.6f}"
-
-
-def build_prices_message(data: dict) -> str:
-    lines = []
-    for coin in COINS:
-        info = data.get(coin)
-        if not info:
-            lines.append(f"• <b>{coin}</b>: n/a")
-            continue
-
-        price = info["price"]
-        change = info["change"]
-        icon = "🟢" if change >= 0 else "🔴"
-        lines.append(
-            f"{icon} <b>{coin}</b>  <code>{format_price(price)}</code>  {change:+.2f}%"
-        )
-
-    ts = datetime.now(tz=DELIVERY_TIMEZONE).strftime("%H:%M, %d %b")
-    return (
-        "<b>Crypto prices [USD]</b>\n\n"
-        + "\n".join(lines)
-        + f"\n\n<i>{ts} Tashkent</i>"
-    )
-
-
-# ---------------- CoinGecko ----------------
+# ---- CryptoCompare API ----
 
 async def fetch_prices(force: bool = False) -> dict:
     global _price_cache, _price_cache_time
-
     now = time.monotonic()
     if not force and _price_cache and now - _price_cache_time < CACHE_TTL:
         return _price_cache
 
-    ids = ",".join(CG_IDS.values())
-    url = (
-        "https://api.coingecko.com/api/v3/simple/price"
-        f"?ids={ids}"
-        "&vs_currencies=usd"
-        "&include_24hr_change=true"
-        "&precision=full"
-    )
-
-    headers = {}
-    if COINGECKO_API_KEY:
-        headers["x-cg-demo-api-key"] = COINGECKO_API_KEY
-
-    async with aiohttp.ClientSession(headers=headers) as session:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+    async with aiohttp.ClientSession() as session:
+        async with session.get(CC_URL, timeout=aiohttp.ClientTimeout(total=15)) as resp:
             resp.raise_for_status()
             raw = await resp.json()
 
     result = {}
-    for symbol, cg_id in CG_IDS.items():
-        info = raw.get(cg_id, {})
-        price = info.get("usd")
-        change = info.get("usd_24h_change")
-        if price is not None:
-            result[symbol] = {
-                "price": float(price),
-                "change": float(change or 0.0),
+    for coin in COINS:
+        try:
+            info = raw['RAW'][coin]['USD']
+            result[coin] = {
+                'price': float(info['PRICE']),
+                'change': float(info['CHANGEPCT24HOUR']),
             }
+        except (KeyError, TypeError):
+            pass
 
     if result:
         _price_cache = result
@@ -184,130 +103,166 @@ async def fetch_prices(force: bool = False) -> dict:
     return result
 
 
-# ---------------- Commands ----------------
+# ---- Formatting ----
 
-@router.message(CommandStart())
-async def cmd_start(message: Message):
-    user_id = message.from_user.id
-    existing = registered_users.get(user_id)
+def fmt_price(v: float) -> str:
+    if v >= 1000:
+        return f'${v:,.2f}'
+    if v >= 1:
+        return f'${v:,.4f}'
+    return f'${v:,.6f}'
 
-    if existing and existing.get("active"):
-        hour = existing.get("delivery_hour", DEFAULT_DELIVERY_HOUR)
-        await message.answer(
-            "You are already subscribed.\n\n"
-            f"Daily snapshot time: <b>{hour:02d}:00 Asia/Tashkent</b>\n\n"
-            "Use /prices to get prices now.",
-            reply_markup=keyboard(),
-        )
+
+def build_msg(data: dict) -> str:
+    lines = []
+    for coin in COINS:
+        info = data.get(coin)
+        if not info:
+            lines.append(f'- <b>{coin}</b>: n/a')
+            continue
+        p, c = info['price'], info['change']
+        icon = '🟢' if c >= 0 else '🔴'
+        lines.append(f'{icon} <b>{coin}</b>  <code>{fmt_price(p)}</code>  {c:+.2f}%')
+    ts = datetime.now(tz=DELIVERY_TIMEZONE).strftime('%H:%M, %d %b')
+    header = '<b>Crypto prices [USD]</b>'
+    footer = f'<i>{ts} Tashkent</i>'
+    return header + '\n\n' + '\n'.join(lines) + '\n\n' + footer
+
+
+# ---- Keyboard ----
+
+def kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='📊 Get prices now', callback_data='get_prices')]
+    ])
+
+
+# ---- Cooldown ----
+
+def cooldown(uid: int) -> float:
+    return max(0.0, USER_COOLDOWN_SECONDS - (time.monotonic() - _user_last_request.get(uid, 0.0)))
+
+def mark(uid: int) -> None:
+    _user_last_request[uid] = time.monotonic()
+
+
+# ---- Shared price sender ----
+
+async def send_prices(message: Message, uid: int) -> None:
+    w = cooldown(uid)
+    if w > 0:
+        await message.answer(f'Please wait {int(w)+1}s.')
         return
 
-    registered_users[user_id] = {
-        "chat_id": message.chat.id,
-        "active": True,
-        "delivery_hour": DEFAULT_DELIVERY_HOUR,
-        "registered_at": datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-    }
-    save_subscribers()
-
-    await message.answer(
-        "<b>Welcome to Hamza Rates!</b>\n\n"
-        "Tracked coins: <b>BTC, ETH, BNB, TON, XRP</b>\n"
-        "Currency: <b>USD</b>\n"
-        f"Daily time: <b>{DEFAULT_DELIVERY_HOUR:02d}:00 Asia/Tashkent</b>\n\n"
-        "/prices — prices now\n"
-        "/settime 21 — change delivery hour\n"
-        "/status — your settings\n"
-        "/stop — unsubscribe",
-        reply_markup=keyboard(),
-    )
-
-
-@router.message(Command("prices"))
-async def cmd_prices(message: Message):
-    user_id = message.from_user.id
-    wait = check_cooldown(user_id)
-    if wait > 0:
-        await message.answer(f"Please wait {int(wait) + 1}s.")
-        return
-
-    mark_request(user_id)
+    mark(uid)
 
     try:
         data = await fetch_prices()
-        await message.answer(build_prices_message(data), reply_markup=keyboard())
+        await message.answer(build_msg(data), reply_markup=kb())
     except Exception as e:
-        log.error("fetch error: %s", e)
+        log.error('fetch error: %s', e)
+        await message.answer('Could not get prices. Try again in a moment.', reply_markup=kb())
+
+
+# ---- Handlers ----
+
+@router.message(CommandStart())
+async def cmd_start(message: Message):
+    uid = message.from_user.id
+    ex = registered_users.get(uid)
+
+    if ex and ex.get('active'):
+        h = ex.get('delivery_hour', DEFAULT_DELIVERY_HOUR)
         await message.answer(
-            "Could not get prices right now. Try again in a moment.",
-            reply_markup=keyboard(),
+            f'Already subscribed. Daily at <b>{h:02d}:00 Tashkent</b>.\n\n/prices to get prices now.',
+            reply_markup=kb()
         )
-
-
-@router.message(Command("settime"))
-async def cmd_settime(message: Message):
-    user = registered_users.get(message.from_user.id)
-    if not user or not user.get("active"):
-        await message.answer("Send /start first.")
         return
 
-    parts = (message.text or "").strip().split()
-    if len(parts) < 2 or not parts[1].isdigit():
-        await message.answer("Usage: /settime 9")
-        return
-
-    hour = int(parts[1])
-    if not (0 <= hour <= 23):
-        await message.answer("Hour must be from 0 to 23.")
-        return
-
-    user["delivery_hour"] = hour
+    registered_users[uid] = {
+        'chat_id': message.chat.id,
+        'active': True,
+        'delivery_hour': DEFAULT_DELIVERY_HOUR,
+        'registered_at': datetime.now(tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC'),
+    }
     save_subscribers()
 
-    await message.answer(f"Daily delivery time set to <b>{hour:02d}:00 Asia/Tashkent</b>.")
-
-
-@router.message(Command("status"))
-async def cmd_status(message: Message):
-    user = registered_users.get(message.from_user.id)
-    if user and user.get("active"):
-        hour = user.get("delivery_hour", DEFAULT_DELIVERY_HOUR)
-        await message.answer(
-            "Subscribed.\n\n"
-            "Coins: <b>BTC, ETH, BNB, TON, XRP</b>\n"
-            f"Time: <b>{hour:02d}:00 Asia/Tashkent</b>",
-            reply_markup=keyboard(),
-        )
-    else:
-        await message.answer("You are not subscribed. Send /start.", reply_markup=keyboard())
-
-
-@router.message(Command("stop"))
-async def cmd_stop(message: Message):
-    user = registered_users.get(message.from_user.id)
-    if user and user.get("active"):
-        user["active"] = False
-        save_subscribers()
-        await message.answer("You have been unsubscribed. Send /start to subscribe again.")
-    else:
-        await message.answer("You are not subscribed. Send /start.")
-
-
-@router.message(Command("help"))
-async def cmd_help(message: Message):
+    h = DEFAULT_DELIVERY_HOUR
     await message.answer(
-        "<b>Hamza Rates</b>\n\n"
-        "/prices — get prices now\n"
-        "/settime 9 — set daily delivery hour\n"
-        "/status — your settings\n"
-        "/stop — unsubscribe\n\n"
-        "Coins: BTC, ETH, BNB, TON, XRP\n"
-        "Source: CoinGecko",
-        reply_markup=keyboard(),
+        '<b>Welcome to Hamza Rates!</b>\n\n'
+        f'Coins: <b>BTC, ETH, BNB, TON, XRP</b>\n'
+        f'Daily at: <b>{h:02d}:00 Tashkent</b>\n\n'
+        '/prices — prices now\n'
+        '/settime 21 — change delivery hour\n'
+        '/status — settings\n'
+        '/stop — unsubscribe',
+        reply_markup=kb()
     )
 
 
-@router.callback_query(F.data == "get_prices")
-async def cb_get_prices(callback: CallbackQuery):
+@router.message(Command('prices'))
+async def cmd_prices(message: Message):
+    await send_prices(message, message.from_user.id)
+
+
+@router.message(Command('settime'))
+async def cmd_settime(message: Message):
+    uid = message.from_user.id
+    user = registered_users.get(uid)
+    if not user or not user.get('active'):
+        await message.answer('Send /start first.')
+        return
+
+    parts = (message.text or '').strip().split()
+    if len(parts) < 2 or not parts[1].isdigit() or not (0 <= int(parts[1]) <= 23):
+        await message.answer('Usage: /settime 9  (hour 0-23)')
+        return
+
+    h = int(parts[1])
+    user['delivery_hour'] = h
+    save_subscribers()
+    await message.answer(f'Daily delivery set to <b>{h:02d}:00 Tashkent</b>.')
+
+
+@router.message(Command('stop'))
+async def cmd_stop(message: Message):
+    user = registered_users.get(message.from_user.id)
+    if user and user.get('active'):
+        user['active'] = False
+        save_subscribers()
+        await message.answer('Unsubscribed. /start to subscribe again.')
+    else:
+        await message.answer('Not subscribed. /start to subscribe.')
+
+
+@router.message(Command('status'))
+async def cmd_status(message: Message):
+    user = registered_users.get(message.from_user.id)
+    if user and user.get('active'):
+        h = user.get('delivery_hour', DEFAULT_DELIVERY_HOUR)
+        await message.answer(
+            f'✅ Subscribed\nCoins: <b>BTC, ETH, BNB, TON, XRP</b>\nDaily at: <b>{h:02d}:00 Tashkent</b>',
+            reply_markup=kb()
+        )
+    else:
+        await message.answer('Not subscribed. /start to subscribe.', reply_markup=kb())
+
+
+@router.message(Command('help'))
+async def cmd_help(message: Message):
+    await message.answer(
+        '<b>Hamza Rates</b>\n\n'
+        '/prices — prices now\n'
+        '/settime 9 — delivery hour (0-23)\n'
+        '/status — settings\n'
+        '/stop — unsubscribe\n\n'
+        'Coins: BTC ETH BNB TON XRP | Source: CryptoCompare',
+        reply_markup=kb()
+    )
+
+
+@router.callback_query(F.data == 'get_prices')
+async def cb_prices(callback: CallbackQuery):
     try:
         await callback.answer()
     except TelegramBadRequest:
@@ -316,136 +271,95 @@ async def cb_get_prices(callback: CallbackQuery):
     if not callback.message or not callback.from_user:
         return
 
-    user_id = callback.from_user.id
-    wait = check_cooldown(user_id)
-    if wait > 0:
-        await callback.message.answer(f"Please wait {int(wait) + 1}s.")
-        return
-
-    mark_request(user_id)
-
-    try:
-        data = await fetch_prices()
-        await callback.message.answer(build_prices_message(data), reply_markup=keyboard())
-    except Exception as e:
-        log.error("fetch error: %s", e)
-        await callback.message.answer(
-            "Could not get prices right now. Try again in a moment.",
-            reply_markup=keyboard(),
-        )
+    await send_prices(callback.message, callback.from_user.id)
 
 
 @router.message()
 async def fallback(message: Message):
-    await message.answer(
-        "Use /prices to get crypto prices or /help to see commands.",
-        reply_markup=keyboard(),
-    )
+    await message.answer('/prices — prices | /help — commands', reply_markup=kb())
 
 
-# ---------------- Scheduler ----------------
+# ---- Scheduler ----
 
-async def send_daily_snapshots(bot: Bot):
+async def send_daily(bot: Bot):
     current_hour = datetime.now(tz=DELIVERY_TIMEZONE).hour
-
     targets = [
-        info
-        for info in registered_users.values()
-        if info.get("active") and info.get("delivery_hour", DEFAULT_DELIVERY_HOUR) == current_hour
+        v for v in registered_users.values()
+        if v.get('active') and v.get('delivery_hour', DEFAULT_DELIVERY_HOUR) == current_hour
     ]
-
     if not targets:
         return
 
     try:
         data = await fetch_prices(force=True)
-        text = build_prices_message(data)
+        text = build_msg(data)
     except Exception as e:
-        log.error("daily fetch failed: %s", e)
+        log.error('daily fetch failed: %s', e)
         return
 
-    sent = 0
-    failed = 0
-
-    for user in targets:
+    sent = failed = 0
+    for u in targets:
         try:
-            await bot.send_message(
-                chat_id=user["chat_id"],
-                text=text,
-                reply_markup=keyboard(),
-            )
+            await bot.send_message(chat_id=u['chat_id'], text=text, reply_markup=kb())
             sent += 1
         except Exception as e:
             failed += 1
-            log.error("send failed: %s", e)
+            log.error('send failed: %s', e)
 
-    log.info("Daily snapshot done — sent=%d failed=%d", sent, failed)
-
-
-async def setup_commands(bot: Bot):
-    await bot.set_my_commands(
-        [
-            BotCommand(command="prices", description="Get prices now"),
-            BotCommand(command="settime", description="Set daily delivery hour"),
-            BotCommand(command="status", description="Your settings"),
-            BotCommand(command="stop", description="Unsubscribe"),
-            BotCommand(command="help", description="All commands"),
-        ]
-    )
+    log.info('Daily %02d:00 done sent=%d failed=%d', current_hour, sent, failed)
 
 
-# ---------------- Health server ----------------
+async def setup_commands(bot: Bot) -> None:
+    await bot.set_my_commands([
+        BotCommand(command='prices', description='Get prices now'),
+        BotCommand(command='settime', description='Set delivery hour'),
+        BotCommand(command='status', description='Subscription info'),
+        BotCommand(command='stop', description='Unsubscribe'),
+        BotCommand(command='help', description='All commands'),
+    ])
+
+
+# ---- Health server ----
 
 async def start_health_server():
-    async def health(_request):
-        return aio_web.Response(text="OK")
+    async def health(_req):
+        return aio_web.Response(text='OK')
 
     app = aio_web.Application()
-    app.router.add_get("/", health)
-    app.router.add_get("/health", health)
+    app.router.add_get('/', health)
+    app.router.add_get('/health', health)
 
     runner = aio_web.AppRunner(app)
     await runner.setup()
 
-    port = int(os.getenv("PORT", "10000"))
-    site = aio_web.TCPSite(runner, "0.0.0.0", port)
+    port = int(os.getenv('PORT', '10000'))
+    site = aio_web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
 
-    log.info("Health server started on port %d", port)
+    log.info('Health server on port %d', port)
     return runner
 
 
-# ---------------- Main ----------------
+# ---- Main ----
 
 async def main():
     if not BOT_TOKEN:
-        raise ValueError("BOT_TOKEN not set")
+        raise ValueError('BOT_TOKEN not set')
 
     runner = await start_health_server()
 
-    bot = Bot(
-        token=BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-    )
-
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
     dp.include_router(router)
 
     scheduler = AsyncIOScheduler(timezone=DELIVERY_TIMEZONE)
-    scheduler.add_job(
-        send_daily_snapshots,
-        trigger="cron",
-        minute=0,
-        args=[bot],
-        id="daily_snapshot",
-        replace_existing=True,
-    )
+    scheduler.add_job(send_daily, 'cron', minute=0, args=[bot], id='daily', replace_existing=True)
     scheduler.start()
 
     await setup_commands(bot)
 
     me = await bot.get_me()
-    log.info("Bot started: @%s | Subscribers: %d", me.username, len(registered_users))
+    log.info('Bot started: @%s | Subscribers: %d', me.username, len(registered_users))
 
     try:
         await dp.start_polling(bot, drop_pending_updates=True)
@@ -453,8 +367,8 @@ async def main():
         scheduler.shutdown(wait=False)
         await runner.cleanup()
         await bot.session.close()
-        log.info("Bot stopped.")
+        log.info('Stopped.')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     asyncio.run(main())
